@@ -115,6 +115,7 @@ ON
   m.date = t.date AND m.store_nbr = t.store_nbr AND m.item_nbr = t.item_nbr
 ;
 
+
 -- dest. table: ma8.train_2017_ext_ma_last
 SELECT
   *
@@ -159,7 +160,7 @@ FROM
   `ma8.train_2017_ext_ma_last`
 
 
--- dest. table: mean_baseline.submit_ma8
+-- dest. table: ma8.submit_ma8
 SELECT
   t.id as id,
   CASE WHEN a.unit_sales is null THEN 0 ELSE a.unit_sales END as unit_sales
@@ -178,6 +179,175 @@ FROM
   ma8.submit_ma8 as s
 LEFT OUTER JOIN
   ma8.submit_kernel as k
+ON
+  s.id = k.id
+ORDER BY
+  diff desc
+limit 10
+
+
+-- Log MA and Days of Week Means (LB: 0.534)
+-- https://www.kaggle.com/paulorzp/log-ma-and-days-of-week-means-lb-0-534
+
+-- dest. table: ma8dw.mst_data
+SELECT
+  *
+FROM
+(
+SELECT
+  distinct(date)
+FROM
+  corpora2.train
+WHERE
+  date >= '2017-01-01'
+),
+(
+SELECT
+  distinct(store_nbr)
+FROM
+  corpora2.train
+WHERE
+  date >= '2017-01-01'
+),
+(
+SELECT
+  distinct(item_nbr)
+FROM
+  corpora2.train
+WHERE
+  date >= '2017-01-01'
+)
+
+-- dest. table: ma8dw.train_2017_ext
+SELECT
+  m.date as date,
+  FORMAT_DATE('%a', m.date) as dow,
+  m.store_nbr as store_nbr,
+  m.item_nbr as item_nbr,
+  CASE WHEN t.unit_sales > 0 THEN LN(t.unit_sales + 1) ELSE 0 END unit_sales
+FROM
+  ma8dw.mst_data as m
+LEFT OUTER JOIN
+  corpora2.train as t
+ON
+  m.date = t.date AND m.store_nbr = t.store_nbr AND m.item_nbr = t.item_nbr
+;
+
+-- dest. table: ma8dw.train_2017_mean_dow
+SELECT
+  store_nbr, item_nbr, dow,
+  AVG(unit_sales) as unit_sales
+FROM
+(
+  SELECT
+    store_nbr, item_nbr, FORMAT_DATE('%a', date) as dow,
+    CASE WHEN unit_sales > 0 THEN LN(unit_sales + 1) ELSE 0 END unit_sales
+  FROM
+    corpora2.train
+  WHERE
+    date >= '2017-01-01'
+)
+GROUP BY
+  store_nbr, item_nbr, dow
+
+-- dest. table: ma8dw.train_2017_mean_week
+SELECT
+  store_nbr, item_nbr,
+  AVG(unit_sales) as unit_sales
+FROM
+  ma8dw.train_2017_mean_dow
+GROUP BY
+  store_nbr, item_nbr
+
+-- dest. table: ma8dw.train_2017_ext_ma_last
+SELECT
+  *
+FROM
+(
+SELECT
+  ROW_NUMBER() OVER(partition by store_nbr, item_nbr order by date desc) row_num,
+  date,
+  store_nbr,
+  item_nbr,
+  unit_sales as ma001,
+  AVG(unit_sales) OVER(partition by store_nbr, item_nbr order by date ROWS BETWEEN 2 PRECEDING AND CURRENT ROW) as ma003,
+  AVG(unit_sales) OVER(partition by store_nbr, item_nbr order by date ROWS BETWEEN 6 PRECEDING AND CURRENT ROW) as ma007,
+  AVG(unit_sales) OVER(partition by store_nbr, item_nbr order by date ROWS BETWEEN 13 PRECEDING AND CURRENT ROW) as ma014,
+  AVG(unit_sales) OVER(partition by store_nbr, item_nbr order by date ROWS BETWEEN 27 PRECEDING AND CURRENT ROW) as ma028,
+  AVG(unit_sales) OVER(partition by store_nbr, item_nbr order by date ROWS BETWEEN 55 PRECEDING AND CURRENT ROW) as ma056,
+  AVG(unit_sales) OVER(partition by store_nbr, item_nbr order by date ROWS BETWEEN 111 PRECEDING AND CURRENT ROW) as ma112,
+  --AVG(unit_sales) OVER(partition by store_nbr, item_nbr order by date ROWS BETWEEN 225 PRECEDING AND CURRENT ROW) as ma226
+  AVG(unit_sales) OVER(partition by store_nbr, item_nbr order by date ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) as ma226
+FROM
+  ma8dw.train_2017_ext
+)
+WHERE
+  row_num = 1
+
+-- dest. table: ma8dw.mst_2017_ma8
+CREATE TEMPORARY FUNCTION median(x ARRAY<FLOAT64>)
+RETURNS FLOAT64
+LANGUAGE js AS """
+  var center = (x.length / 2) | 0;
+  var x_sorted = x.sort();
+  if (x_sorted.length % 2) {
+    return x_sorted[center];
+  } else {
+    return (x_sorted[center - 1] + x_sorted[center]) / 2;
+  }
+""";
+SELECT
+  store_nbr,
+  item_nbr,
+  median([ma001, ma003, ma007, ma014, ma028, ma056, ma112, ma226]) as unit_sales
+FROM
+  `ma8dw.train_2017_ext_ma_last`
+
+
+-- dest. table: ma8dw.submit_ma8dw
+SELECT
+  t.id as id,
+  CASE
+   WHEN a.unit_sales is not null and d.unit_sales is not null and w.unit_sales > 0 THEN
+   EXP(a.unit_sales * d.unit_sales / w.unit_sales) - 1
+   WHEN  a.unit_sales is not null THEN
+   EXP(a.unit_sales) - 1
+   ELSE
+   0
+  END as unit_sales
+FROM
+  (
+  SELECT
+  id,
+  date,
+  FORMAT_DATE('%a', date) as dow,
+  store_nbr,
+  item_nbr
+  FROM
+    corpora2.test
+  ) as t
+LEFT OUTER JOIN
+  ma8dw.mst_2017_ma8 as a
+ON
+  t.item_nbr = a.item_nbr AND t.store_nbr = a.store_nbr
+LEFT OUTER JOIN
+  ma8dw.train_2017_mean_dow as d
+ON
+  t.item_nbr = d.item_nbr AND t.store_nbr = d.store_nbr AND t.dow = d.dow
+LEFT OUTER JOIN
+  ma8dw.train_2017_mean_week as w
+ON
+  t.item_nbr = w.item_nbr AND t.store_nbr = w.store_nbr
+
+
+-- for debug, you need to import this kernle submit to mean_baseline.submit_kernel
+SELECT
+  s.id,s.unit_sales, k.unit_sales as k_unit_sales,
+  ABS(s.unit_sales - k.unit_sales) as diff
+FROM
+  ma8dw.submit_ma8dw_2 as s
+LEFT OUTER JOIN
+  ma8dw.sumit_kernel as k
 ON
   s.id = k.id
 ORDER BY
